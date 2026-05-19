@@ -1,0 +1,19 @@
+# 데이터 파일 (용량이 크므로 GitHub에 올리지 않음)
+# 각자 AI Hub에서 직접 다운로드하여 data/raw/에 넣을 것
+data/raw/
+data/processed/
+data/sketches/
+
+# 전처리 결과 리포트
+outputs/
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# OS 파일
+.DS_Store
+Thumbs.db
