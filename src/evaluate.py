@@ -56,6 +56,19 @@ python evaluate.py            # OURS_DIR / BASELINE_DIR 를 모두 평가 후 �
           이후 유료 GPU 환경에서 SDXL 로 본 학습을 진행하여 실제 평가 대상이 바뀌었다.
           표기와 실제 모델이 어긋나면 결과 해석에 혼동이 생기므로 맞춘다.
   주의:   문자열 표기만 바꾼 것이며 계산 로직에는 영향이 없다.
+
+[2026-07-27] q_copy 비교군에서 testset 제외
+  무엇을: EXCLUDE_TESTSET_FROM_COPY 설정을 추가하고, q_copy() 에서
+          평가 대상 폴더의 파일 stem 과 겹치는 원본을 비교군에서 걸러내도록 변경.
+  왜:     q_copy 는 "모델이 학습 이미지를 암기했는가"를 보는 지표인데,
+          비교군인 TARGET_DIR(image_txt)에는 학습 이미지와 testset 원본이 섞여 있었다.
+          그래서 생성 이미지가 자기 자신의 원본과 최근접으로 매칭되어
+          (예: 생성 02569.png ↔ 원본 02569.png, sim 0.97) 유사도가 부풀려졌다.
+          이는 암기가 아니라 "원본을 잘 재현했다"는 의미이므로 해석이 정반대가 된다.
+  방법:   평가 대상 폴더의 stem 집합을 만들어 비교군에서 제외하고,
+          제외된 장수와 최종 비교군 크기를 로그/반환값에 남긴다.
+  영향:   testset 을 학습에서 제외한 모델이라면 이 수정 후 q_copy 가 낮아지는 것이
+          정상이다. 낮아진 값이 실제 암기 정도에 가깝다.
 """
 
 from pathlib import Path
@@ -73,6 +86,15 @@ PROJECT_ROOT = Path("/content/drive/MyDrive/BUHT")
 DATA_ROOT = PROJECT_ROOT / "data"
 SKETCH_DIR = DATA_ROOT / "sketch"        # 입력 스케치 (conditioning_image)
 TARGET_DIR = DATA_ROOT / "image_txt"     # 실제 수묵화 원본 + 캡션(.txt)
+
+# --- q_copy 설정 ---
+# q_copy 는 "모델이 학습 이미지를 암기했는가"를 보는 지표이므로,
+# 비교 대상은 반드시 '학습에 실제로 쓰인 이미지'여야 한다.
+# TARGET_DIR 에는 testset 원본까지 함께 들어있어, 그대로 비교하면
+# 생성 이미지가 자기 자신의 원본과 매칭되어 유사도가 부풀려진다.
+# (예: 생성 02569.png ↔ 원본 02569.png 유사도 0.97)
+# True 로 두면 평가 대상 폴더(=testset)의 파일 stem 을 비교군에서 제외한다.
+EXCLUDE_TESTSET_FROM_COPY = True
 
 # --- 생성 이미지 경로 ---
 OUTPUT_ROOT = Path("/content/drive/MyDrive/korean_sketch_model")
@@ -380,11 +402,34 @@ def q_copy(gen_dir: Path = OURS_DIR, real_dir: Path = TARGET_DIR, top_k: int = 5
 
     참고: 화풍이 같은 도메인이므로 0.7~0.85 정도의 유사도는 자연스러운 수준이다.
     절대값보다 baseline 대비 얼마나 높은지, 그리고 상위 쌍의 실제 모습이 중요하다.
+
+    중요: EXCLUDE_TESTSET_FROM_COPY=True 이면 평가 대상(testset) 원본을
+    비교군에서 제외한다. 제외하지 않으면 생성 이미지가 자기 자신의 원본과
+    매칭되어 지표가 왜곡되므로, 특별한 이유가 없으면 True 를 유지할 것.
     """
     gen_paths = list_images(gen_dir)
     real_paths = list_images(real_dir)
+
+    # [수정 2026-07-27] testset 원본을 비교군에서 제외한다.
+    # 이유: real_dir(image_txt)에는 학습 이미지와 testset 원본이 섞여 있다.
+    #       제외하지 않으면 생성 이미지가 '자기 자신의 원본'과 매칭되어
+    #       (예: 생성 02569.png ↔ 원본 02569.png) 유사도가 0.95 이상으로 뜨는데,
+    #       이는 암기(과적합)가 아니라 "원본을 잘 재현했다"는 뜻이므로
+    #       q_copy 의 해석이 정반대로 뒤집힌다.
+    # 방법: 평가 대상 폴더의 파일 stem 집합을 만들어 비교군에서 걸러낸다.
+    excluded = 0
+    if EXCLUDE_TESTSET_FROM_COPY:
+        test_stems = {p.stem for p in gen_paths}
+        before = len(real_paths)
+        real_paths = [p for p in real_paths if p.stem not in test_stems]
+        excluded = before - len(real_paths)
+
     if not gen_paths or not real_paths:
         raise RuntimeError(f"[q_copy] 이미지가 부족합니다: gen={len(gen_paths)}, real={len(real_paths)}")
+
+    if excluded:
+        print(f"  [q_copy] testset {excluded}장을 비교군에서 제외 "
+              f"(비교 대상 {len(real_paths)}장)")
 
     gen_emb = _clip_image_embeddings(gen_paths)    # (G, D)
     real_emb = _clip_image_embeddings(real_paths)  # (R, D)
@@ -409,6 +454,8 @@ def q_copy(gen_dir: Path = OURS_DIR, real_dir: Path = TARGET_DIR, top_k: int = 5
         "max_sim": float(max_sim.max()),        # 최악(가장 복사에 가까운) 케이스
         "top_matches": top_matches,
         "n": len(gen_paths),
+        "n_compared": len(real_paths),   # 비교군 크기 (testset 제외 후)
+        "n_excluded": excluded,          # 비교군에서 제외된 testset 장수
     }
 
 
