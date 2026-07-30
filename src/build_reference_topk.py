@@ -41,6 +41,18 @@ outputs/reference_topk.csv  : image, rank, reference, similarity
   왜:     reference 조건을 학습에 넣기 위해, 이미지별 참고 대상 목록이 필요하다.
   방법:   이미지 임베딩 유사도 상위 k개를 뽑고, 자기 자신과 같은 base ID 는 제외.
           caption_map.csv 의 original_filename 으로 base ID 를 판별한다.
+
+[2026-07-30] caption_map 경로/누락 처리 강화
+  무엇을: (1) CAPTION_MAP_CSV 를 실행 위치(cwd)가 아니라 스크립트 파일 위치 기준
+              (REPO_ROOT = 이 파일의 부모의 부모 = 레포 루트)으로 찾도록 변경.
+          (2) 파일이 없을 때 경고 후 진행하던 동작을 RuntimeError 중단으로 변경.
+              ALLOW_MISSING_CAPTION_MAP=True 로 명시해야만 base ID 제외 없이 진행한다.
+  왜:     caption_map.csv 는 드라이브가 아니라 레포 루트에 있어 상대경로("caption_map.csv")
+          로는 실행 위치에 따라 조용히 못 찾는 문제가 있었다.
+          또한 base ID 제외는 데이터 품질에 직결된다 — 같은 원본의 편집본이 서로
+          reference 로 뽑히면 모델에 정답을 미리 보여주는 셈이라 학습이 오염된다.
+          이게 경고만 찍고 조용히 스킵되면 오염된 매핑이 그대로 학습에 들어갈 위험이 크다.
+  방법:   없으면 기본적으로 중단하고, 정말 없이 진행할 때만 플래그를 켜도록 강제한다.
 """
 
 import csv
@@ -62,9 +74,20 @@ DATA_ROOT = PROJECT_ROOT / "data"
 # 학습 이미지 폴더 (512 전처리본 + 캡션 .txt 가 함께 있는 폴더)
 IMAGE_DIR = DATA_ROOT / "image_txt"
 
+# 레포 루트 (이 파일: <레포>/src/build_reference_topk.py → 부모의 부모가 레포 루트).
+# caption_map.csv 는 드라이브가 아니라 레포 루트에 있으므로 실행 위치(cwd)와 무관하게
+# 스크립트 파일 위치를 기준으로 찾는다.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 # 원본 파일명 ↔ 전처리 번호 매핑표 (base ID 판별에 사용)
-# 없으면 base ID 제외 규칙 없이 자기 자신만 제외한다.
-CAPTION_MAP_CSV = Path("caption_map.csv")
+CAPTION_MAP_CSV = REPO_ROOT / "caption_map.csv"
+
+# caption_map.csv 가 없을 때의 동작.
+# 기본값 False: 파일이 없으면 RuntimeError 로 중단한다.
+#   → base ID 제외는 데이터 품질에 직결되므로(같은 원본 편집본이 서로 reference 로
+#     뽑히면 학습 오염) 조용히 스킵되지 않도록 강제한다.
+# 정말 base ID 제외 없이(자기 자신만 제외) 진행하려면 아래를 True 로 명시해야 한다.
+ALLOW_MISSING_CAPTION_MAP = False
 
 # 결과 저장 경로
 OUTPUT_DIR = Path("outputs")
@@ -111,10 +134,20 @@ def extract_base_id(original_filename: str) -> str:
 def load_base_id_map(csv_path: Path) -> dict[str, str]:
     """
     caption_map.csv 를 읽어 {전처리번호: base ID} 를 만든다.
-    파일이 없으면 빈 dict 를 반환하고, 그 경우 base ID 제외 규칙은 생략된다.
+
+    파일이 없으면 기본적으로 RuntimeError 로 중단한다.
+    base ID 제외 없이 진행하려면 ALLOW_MISSING_CAPTION_MAP=True 를 명시해야 하며,
+    그 경우에만 빈 dict 를 반환한다(= 자기 자신만 제외).
     """
     if not csv_path.exists():
-        print(f"[경고] {csv_path} 가 없어 base ID 제외 규칙을 건너뜁니다.")
+        if not ALLOW_MISSING_CAPTION_MAP:
+            raise RuntimeError(
+                f"caption_map.csv 를 찾을 수 없습니다: {csv_path}\n"
+                f"base ID 제외 없이 진행하려면 ALLOW_MISSING_CAPTION_MAP=True 로 명시하세요.\n"
+                f"(같은 원본의 편집본이 서로 reference 로 뽑히면 학습이 오염되므로 기본은 중단입니다.)"
+            )
+        print(f"[경고] {csv_path} 가 없지만 ALLOW_MISSING_CAPTION_MAP=True 라 "
+              f"base ID 제외 없이 진행합니다(자기 자신만 제외).")
         return {}
 
     mapping = {}
