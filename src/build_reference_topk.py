@@ -13,11 +13,13 @@ reference 이미지를 조건으로 넣어 학습/생성하려면, 각 이미지
 동작
 ----
 1. 학습 이미지 전체를 CLIP 이미지 임베딩으로 변환
-2. 이미지끼리 코사인 유사도를 계산
-3. 각 이미지에 대해 유사도 상위 k개를 고름
+2. 캡션(training_caption)을 CLIP 텍스트 임베딩으로 변환
+3. 이미지 유사도와 캡션 유사도를 가중 합산
+   (캡션이 비어 있는 이미지가 낀 쌍은 이미지 유사도만 사용)
+4. 각 이미지에 대해 합산 유사도 상위 k개를 고름
    - 자기 자신 제외
    - 같은 base ID(동일 원본의 다른 편집본) 제외
-4. JSON / CSV 두 형태로 저장
+5. JSON / CSV 두 형태로 저장
 
 제외 규칙이 중요한 이유
 ----------------------
@@ -53,6 +55,19 @@ outputs/reference_topk.csv  : image, rank, reference, similarity
           reference 로 뽑히면 모델에 정답을 미리 보여주는 셈이라 학습이 오염된다.
           이게 경고만 찍고 조용히 스킵되면 오염된 매핑이 그대로 학습에 들어갈 위험이 크다.
   방법:   없으면 기본적으로 중단하고, 정말 없이 진행할 때만 플래그를 켜도록 강제한다.
+
+[2026-09-30] 캡션(텍스트) 유사도 반영
+  무엇을: 캡션을 CLIP 텍스트 인코더로 임베딩해 캡션끼리의 유사도를 구하고,
+          최종 유사도 = IMAGE_WEIGHT * 이미지 유사도 + TEXT_WEIGHT * 캡션 유사도 로 변경.
+  왜:     기존에는 그림의 겉모습만 비교해서, 내용(무엇을 그렸는가)이 다른 그림이
+          reference 로 뽑힐 수 있었다. 캡션까지 보면 "비슷하게 생겼고 내용도 맞는"
+          그림을 우선하게 된다.
+  방법:   caption_map.csv 의 training_caption 을 사용한다. 캡션이 빈 270장은
+          텍스트 유사도를 계산할 수 없으므로, 그 이미지가 포함된 쌍은 이미지
+          유사도만 쓴다(가중치를 이미지 쪽으로 몰아준 것과 같음).
+          TEXT_WEIGHT = 0 으로 두면 기존(이미지만) 동작과 완전히 같다.
+  산출물: CSV 에 image_sim / text_sim 컬럼을 추가해 두 유사도를 따로 확인할 수 있다.
+          JSON 형식은 그대로라 이를 읽는 쪽 코드는 바꿀 필요가 없다.
 """
 
 import csv
@@ -102,6 +117,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 유사도가 이 값 이상이면 "사실상 동일 그림"으로 보고 제외한다.
 # 같은 원본의 편집본이 caption_map 에 누락된 경우를 잡기 위한 안전장치.
 DUPLICATE_THRESHOLD = 0.98
+
+# --- 캡션(텍스트) 유사도 반영 ---
+# 최종 유사도 = IMAGE_WEIGHT * 이미지 유사도 + TEXT_WEIGHT * 캡션 유사도
+# 두 값의 합은 1 이 되도록 둔다. TEXT_WEIGHT = 0 이면 기존(이미지만)과 동일.
+# reference 는 "스타일 참고용"이라 겉모습 비중을 더 크게 두었다.
+IMAGE_WEIGHT = 0.7
+TEXT_WEIGHT = 0.3
 
 
 # =====================================================================
@@ -161,6 +183,23 @@ def load_base_id_map(csv_path: Path) -> dict[str, str]:
     return mapping
 
 
+def load_caption_map(csv_path: Path) -> dict[str, str]:
+    """
+    caption_map.csv 에서 {전처리번호: training_caption} 을 만든다.
+    빈 캡션은 포함하지 않는다(= 해당 이미지는 텍스트 유사도 계산 대상에서 빠짐).
+    """
+    if not csv_path.exists():
+        return {}
+    captions = {}
+    with csv_path.open(encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            key = row.get("caption_key") or Path(row.get("preprocessed_file", "")).stem
+            text = (row.get("training_caption") or "").strip()
+            if key and text:
+                captions[key] = text
+    return captions
+
+
 _clip_cache: dict = {}
 
 
@@ -183,7 +222,7 @@ def _as_tensor(feat):
     """
     if isinstance(feat, torch.Tensor):
         return feat
-    for attr in ("image_embeds", "pooler_output"):
+    for attr in ("image_embeds", "text_embeds", "pooler_output"):
         value = getattr(feat, attr, None)
         if isinstance(value, torch.Tensor):
             return value
@@ -206,6 +245,57 @@ def compute_embeddings(paths: list[Path]) -> torch.Tensor:
     return torch.cat(chunks, dim=0)
 
 
+@torch.no_grad()
+def compute_text_embeddings(texts: list[str]) -> torch.Tensor:
+    """
+    캡션 목록을 L2 정규화된 CLIP 텍스트 임베딩으로 변환한다. shape (N, D)
+    CLIP 텍스트 인코더는 최대 77 토큰까지만 받으므로 긴 캡션은 잘린다(truncation).
+    """
+    model, processor = _get_clip()
+    chunks = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i : i + BATCH_SIZE]
+        inputs = processor(
+            text=batch, return_tensors="pt", padding=True, truncation=True
+        ).to(DEVICE)
+        emb = _as_tensor(model.get_text_features(**inputs))
+        chunks.append(emb / emb.norm(dim=-1, keepdim=True))
+        print(f"  텍스트 임베딩 {min(i + BATCH_SIZE, len(texts))}/{len(texts)}", end="\r")
+    print()
+    return torch.cat(chunks, dim=0)
+
+
+def combine_similarity(
+    img_sim: torch.Tensor,
+    stems: list[str],
+    captions: dict[str, str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    이미지 유사도 행렬에 캡션 유사도를 가중 합산한다.
+
+    반환: (최종 유사도 행렬, 캡션 유사도 행렬)
+    캡션 유사도 행렬에서 계산 불가한 쌍(한쪽이라도 캡션이 빈 경우)은 NaN 으로 둔다.
+    그런 쌍의 최종 유사도는 이미지 유사도를 그대로 쓴다.
+    """
+    n = len(stems)
+    txt_sim = torch.full((n, n), float("nan"), device=img_sim.device)
+
+    if TEXT_WEIGHT == 0 or not captions:
+        return img_sim.clone(), txt_sim
+
+    has_cap = [i for i, s in enumerate(stems) if s in captions]
+    print(f"캡션 있는 이미지: {len(has_cap)}/{n} (나머지는 이미지 유사도만 사용)")
+
+    t_emb = compute_text_embeddings([captions[stems[i]] for i in has_cap])
+    idx = torch.tensor(has_cap, device=img_sim.device)
+    txt_sim[idx.unsqueeze(1), idx.unsqueeze(0)] = t_emb @ t_emb.T
+
+    both = ~torch.isnan(txt_sim)
+    final = img_sim.clone()
+    final[both] = IMAGE_WEIGHT * img_sim[both] + TEXT_WEIGHT * txt_sim[both]
+    return final, txt_sim
+
+
 # =====================================================================
 # top-k 선택
 # =====================================================================
@@ -214,6 +304,7 @@ def build_topk(
     paths: list[Path],
     emb: torch.Tensor,
     base_ids: dict[str, str],
+    captions: dict[str, str] | None = None,
     top_k: int = TOP_K,
 ) -> dict[str, list[dict]]:
     """
@@ -225,7 +316,10 @@ def build_topk(
     - 유사도가 DUPLICATE_THRESHOLD 이상 (매핑 누락된 중복 방어)
     """
     stems = [p.stem for p in paths]
-    sim = emb @ emb.T                      # (N, N) 코사인 유사도
+    img_sim = emb @ emb.T                  # (N, N) 이미지 코사인 유사도
+
+    # 캡션 유사도를 섞은 최종 유사도. 이 값으로 순위를 매긴다.
+    sim, txt_sim = combine_similarity(img_sim, stems, captions or {})
 
     # 제외 표시값. 코사인 유사도 범위(-1~1) 밖의 값을 써서
     # "제외된 쌍"과 "유사도가 낮은 정상 후보"를 확실히 구분한다.
@@ -251,7 +345,8 @@ def build_topk(
         print(f"같은 base ID 쌍 제외: {excluded_pairs}건")
 
     # 중복 의심 쌍 제외
-    dup_mask = sim >= DUPLICATE_THRESHOLD
+    # 중복 판정은 '겉모습이 사실상 같은 그림인가'이므로 이미지 유사도 기준으로 한다.
+    dup_mask = (img_sim >= DUPLICATE_THRESHOLD) & (sim > EXCLUDED)
     dup_count = int(dup_mask.sum())
     if dup_count:
         sim[dup_mask] = EXCLUDED
@@ -267,7 +362,13 @@ def build_topk(
             score = float(top_sim[i, rank])
             if score <= EXCLUDED + 0.5:    # 제외 표시된 쌍은 건너뜀
                 continue
-            refs.append({"reference": stems[j], "similarity": round(score, 4)})
+            t = float(txt_sim[i, j])
+            refs.append({
+                "reference": stems[j],
+                "similarity": round(score, 4),                  # 최종(합산) 유사도
+                "image_sim": round(float(img_sim[i, j]), 4),
+                "text_sim": None if t != t else round(t, 4),  # NaN 이면 None
+            })
         result[stem] = refs
     return result
 
@@ -285,10 +386,11 @@ def save_results(topk: dict[str, list[dict]]) -> None:
     # CSV: 유사도까지 포함해 사람이 검토하기 쉬운 형태
     with CSV_PATH.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["image", "rank", "reference", "similarity"])
+        writer.writerow(["image", "rank", "reference", "similarity", "image_sim", "text_sim"])
         for stem, refs in topk.items():
             for rank, r in enumerate(refs, start=1):
-                writer.writerow([stem, rank, r["reference"], r["similarity"]])
+                writer.writerow([stem, rank, r["reference"], r["similarity"],
+                                 r["image_sim"], "" if r["text_sim"] is None else r["text_sim"]])
 
     print(f"\n저장 완료")
     print(f"  {JSON_PATH}")
@@ -302,12 +404,14 @@ def main() -> None:
     print(f"대상 이미지: {len(paths)}장 (device={DEVICE})")
 
     base_ids = load_base_id_map(CAPTION_MAP_CSV)
+    captions = load_caption_map(CAPTION_MAP_CSV)
+    print(f"캡션 로드: {len(captions)}건 (가중치 이미지 {IMAGE_WEIGHT} / 텍스트 {TEXT_WEIGHT})")
 
     print("CLIP 임베딩 계산 중...")
     emb = compute_embeddings(paths)
 
     print(f"top-{TOP_K} reference 선택 중...")
-    topk = build_topk(paths, emb, base_ids)
+    topk = build_topk(paths, emb, base_ids, captions)
 
     # 결과 미리보기 — 뽑힌 reference 가 말이 되는지 눈으로 확인할 것
     print("\n--- 결과 샘플 ---")
